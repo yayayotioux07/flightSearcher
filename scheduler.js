@@ -1,26 +1,47 @@
-// src/scheduler.js
-// Uses node-cron to fire scans at 6 AM, 12 PM, 6 PM, and 12 AM (server time).
-// Also exports runScan() so the API can trigger manual scans.
-
+// scheduler.js
 import cron from "node-cron";
-import { searchFlights } from "./flights.js";
-import { sendDealAlert }  from "./mailer.js";
-import { allActiveRoutes, recordScan } from "./store.js";
+import { searchFlights }                      from "./flights.js";
+import { sendTelegramAlert, sendTelegramMessage } from "./telegram.js";
+import { recordScan }                         from "./store.js";
 
-// ── Core scan function ────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 
-export async function runScan(route) {
-  const tag = `[scanner] ${route.origin}→${route.dest} ${route.date}`;
+const PRICE_THRESHOLD = 150;
+
+const ROUTES = [
+  { id: "mex-mad", origin: "MEX", dest: "MAD" },
+  { id: "cjs-cun", origin: "CJS", dest: "CUN" },
+  { id: "cjs-sjd", origin: "CJS", dest: "SJD" },
+  { id: "cjs-mex", origin: "CJS", dest: "MEX" },
+];
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+
+function getDateRange() {
+  const dates  = [];
+  const start  = new Date();
+  start.setMonth(start.getMonth() + 2);
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(new Date().getFullYear(), 11, 31);
+
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}
+
+// ── Core scan ─────────────────────────────────────────────────────────────────
+
+export async function runScan(route, date) {
+  const tag = `[scanner] ${route.origin}→${route.dest} ${date}`;
   console.log(`${tag} starting…`);
 
   let result;
   try {
-    result = await searchFlights({
-      origin:     route.origin,
-      dest:       route.dest,
-      date:       route.date,
-      returnDate: route.returnDate,
-    });
+    result = await searchFlights({ origin: route.origin, dest: route.dest, date });
   } catch (err) {
     console.error(`${tag} fetch failed:`, err.message);
     return null;
@@ -28,6 +49,7 @@ export async function runScan(route) {
 
   const record = {
     scannedAt: result.scannedAt,
+    date,
     lowest:    result.lowest,
     average:   result.average,
     flights:   result.flights,
@@ -36,67 +58,75 @@ export async function runScan(route) {
   recordScan(route.id, record);
   console.log(`${tag} done — lowest $${result.lowest ?? "N/A"}, ${result.flights.length} flights`);
 
-  // ── Alert logic ───────────────────────────────────────────────────────────
-  const shouldAlert =
-    route.alertEmail &&
-    result.lowest !== null &&
-    (route.priceThreshold === null || result.lowest <= route.priceThreshold);
-
-  if (shouldAlert) {
+  // Alert if under threshold
+  if (result.lowest !== null && result.lowest < PRICE_THRESHOLD) {
     try {
-      await sendDealAlert({
-        to:         route.alertEmail,
+      await sendTelegramAlert({
         origin:     route.origin,
         dest:       route.dest,
-        date:       route.date,
+        date,
         lowest:     result.lowest,
-        threshold:  route.priceThreshold ?? null,
+        threshold:  PRICE_THRESHOLD,
         topFlights: result.flights.sort((a, b) => a.price - b.price).slice(0, 3),
       });
     } catch (err) {
-      console.error(`${tag} email failed:`, err.message);
+      console.error(`${tag} Telegram alert failed:`, err.message);
     }
   }
 
   return record;
 }
 
-// ── Scan all active routes ────────────────────────────────────────────────────
+// ── Scan all routes × all dates ───────────────────────────────────────────────
 
-async function scanAll() {
-  const active = allActiveRoutes();
-  console.log(`[scheduler] Firing scan window — ${active.length} route(s)`);
-  for (const route of active) {
-    await runScan(route);
+export async function scanAll() {
+  const dates = getDateRange();
+  const total = ROUTES.length * dates.length;
+  console.log(`\n[scheduler] Full scan — ${ROUTES.length} routes × ${dates.length} dates (${total} searches)`);
+
+  await sendTelegramMessage(
+    `🔍 Skanner starting scan\n${ROUTES.length} routes × ${dates.length} dates\n${new Date().toLocaleString("en-MX", { timeZone: "America/Mexico_City" })}`
+  );
+
+  let deals = 0;
+
+  for (const route of ROUTES) {
+    for (const date of dates) {
+      const record = await runScan(route, date);
+      if (record?.lowest && record.lowest < PRICE_THRESHOLD) deals++;
+      await new Promise(r => setTimeout(r, 1200)); // rate limit buffer
+    }
   }
+
+  await sendTelegramMessage(
+    `✅ Scan complete\nDeals found under $${PRICE_THRESHOLD}: ${deals}\n${new Date().toLocaleString("en-MX", { timeZone: "America/Mexico_City" })}`
+  );
+
+  console.log(`[scheduler] Scan complete — ${deals} deals found`);
 }
 
-// ── Schedule: 6 AM, 12 PM, 6 PM, 12 AM ──────────────────────────────────────
-//   Cron format: second minute hour day month weekday
-//   Railway server runs UTC — adjust the hour values if you want local time.
-//   To convert: if you're in UTC-6 (CST), add 6 to each hour.
-//   6 AM CST  = 12:00 UTC → "0 12 * * *"
-//   12 PM CST = 18:00 UTC → "0 18 * * *"
-//   6 PM CST  = 00:00 UTC → "0 0 * * *"
-//   12 AM CST = 06:00 UTC → "0 6 * * *"
-//
-//   Default below uses UTC directly. Set TZ env var on Railway to auto-convert.
+// ── Cron: 6am and 6pm Mexico City time ───────────────────────────────────────
 
 export function startScheduler() {
-  const jobs = [
-    { label: "06:00", expr: "0 6 * * *"  },
-    { label: "12:00", expr: "0 12 * * *" },
-    { label: "18:00", expr: "0 18 * * *" },
-    { label: "00:00", expr: "0 0 * * *"  },
-  ];
+  cron.schedule("0 6 * * *", () => {
+    console.log("\n[scheduler] ⏰ 6:00 AM triggered");
+    scanAll().catch(err => console.error("[scheduler] error:", err));
+  });
 
-  for (const job of jobs) {
-    cron.schedule(job.expr, () => {
-      console.log(`[scheduler] ${job.label} window triggered`);
-      scanAll().catch(err => console.error("[scheduler] error:", err));
-    });
-    console.log(`[scheduler] Registered ${job.label} cron`);
-  }
+  cron.schedule("0 18 * * *", () => {
+    console.log("\n[scheduler] ⏰ 6:00 PM triggered");
+    scanAll().catch(err => console.error("[scheduler] error:", err));
+  });
 
-  console.log("[scheduler] All scan windows active ✓");
+  console.log("[scheduler] ✓ 6:00 AM scan scheduled");
+  console.log("[scheduler] ✓ 6:00 PM scan scheduled");
+  console.log(`[scheduler] Routes: ${ROUTES.map(r => `${r.origin}→${r.dest}`).join(", ")}`);
+  console.log(`[scheduler] Threshold: $${PRICE_THRESHOLD}\n`);
+
+  // Send a startup message to confirm bot is working
+  sendTelegramMessage(
+    `✈ Skanner is online!\nMonitoring: ${ROUTES.map(r => `${r.origin}→${r.dest}`).join(", ")}\nAlert threshold: $${PRICE_THRESHOLD}\nScans at 6:00 AM and 6:00 PM (Mexico City)`
+  ).catch(() => {});
 }
+
+export { ROUTES, PRICE_THRESHOLD };
